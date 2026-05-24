@@ -5,9 +5,10 @@
 | 概念 | 类型 | 说明 |
 |------|------|------|
 | ReleaseStatus | 枚举 | 版本所处的生命周期状态，共 4 种 |
-| ReleaseAttempt | 实体 | 一次发布尝试，以 UUID 唯一标识 |
+| ReleaseEntry | 事件 | journal 中的一行，不可变、仅追加，记录一次状态变更 |
+| ReleaseRecord | 投影 | 内存中的业务实体，由 journal 回放投影得出 |
 | Transition | 行为 | 状态间的合法转换，由 CLI 命令触发 |
-| Journal | 存储 | 追加写的 JSONL 事件日志，是系统事实来源 |
+| Journal | 存储 | 追加写的 JSONL 事件日志，是系统唯一事实来源 |
 
 ## 2. 状态机
 
@@ -39,20 +40,45 @@
 
 从 `Retired` 出发的任何转换、`Published → Cancelled`、`Cancelled → Published`、`Staged → Retired` 等均被模型拒绝。
 
-## 3. 实体：ReleaseAttempt
+## 3. 事件与投影
+
+### ReleaseEntry（journal 事件，不可变）
 
 ```
-ReleaseAttempt {
-    id:         UUID v4    — 每次 stage 生成（cancelled 后 restage 生成新 ID）
-    version:    String     — vX.Y.Z 或 pkg/vX.Y.Z
+ReleaseEntry {
+    id:         String    — UUID，同一次尝试内所有 entry 共享
+    version:    String    — vX.Y.Z 或 pkg/vX.Y.Z
     status:     ReleaseStatus
-    created_at: u64        — UNIX 时间戳
-    updated_at: u64        — 最后变更时间
-    reason:     String     — 原因备注（可选，暂未从 CLI 暴露）
+    created_at: String    — 该事件被记录的时间（UNIX 秒）
 }
 ```
 
-版本号是业务标识键。`FileStorage::load(version)` 用 version 查找，保证每个 version 在 journal 中只有一条当前状态。
+### ReleaseRecord（业务实体，由回放得出）
+
+```
+ReleaseRecord {
+    id:         String    — UUID，取最后一个 entry 的 id
+    version:    String
+    status:     ReleaseStatus  — 取最后一个 entry 的 status
+    created_at: String    — 取第一个 entry 的 created_at（首次 stage 时间）
+    updated_at: String    — 取最后一个 entry 的 created_at（最近变更时间）
+}
+```
+
+### 投影示例
+
+```
+Journal:                                            Record:
+{id:u1, v1.0.0, Staged,     created_at:100}        {id:u2, v1.0.0, Published,
+{id:u1, v1.0.0, Cancelled,  created_at:200}          created_at:100, updated_at:400}
+{id:u2, v1.0.0, Staged,     created_at:300}
+{id:u2, v1.0.0, Published,  created_at:400}
+```
+
+- `created_at` = 100（第一个 entry，首次 stage）
+- `updated_at` = 400（最后一个 entry，本次发布）
+- `id` = u2（最后一个 entry，即当前尝试）
+- 版本号是业务标识键。`FileStorage::load(version)` 按 version 查找。
 
 ## 4. 持久化：事件溯源模式
 
@@ -62,8 +88,8 @@ ReleaseAttempt {
 
 ### 读写策略
 
-- **写**：每次状态变更，将完整 `ReleaseAttempt` 作为一行 JSON 追加到文件末尾
-- **读**：启动时顺序回放所有行，按 version 去重（后出现的覆盖先出现的），重建内存中的 `Vec<ReleaseAttempt>`
+- **写** (`save`)：将 `ReleaseRecord` 转成 `ReleaseEntry`（`created_at = record.updated_at`），作为一行 JSON 追加到文件末尾
+- **读** (`new`)：顺序回放所有行，解析为 `ReleaseEntry`，按 version 投影为 `Vec<ReleaseRecord>`。投影规则：`created_at` 取该 version 的第一个 entry 的时间，`updated_at`/`status`/`id` 取最后一个 entry
 
 ### 设计取舍
 
@@ -107,8 +133,8 @@ release_ok = create_release(...)    → gh release create ...
 |----------|------|------|
 | ReleaseStatus | 2 | Debug、Clone+Eq |
 | validate_transition | 2 | 合法 4 条 + 非法 8 条 |
-| ReleaseAttempt | 2 | 新建字段、ID 唯一性 |
-| FileStorage | 6 | 读写、不存在、更新、事件追加、list、跨实例持久化 |
+| ReleaseRecord | 1 | 字段值正确性 |
+| FileStorage | 7 | 读写、不存在、更新（含 updated_at 变更）、journal 追加、list、跨实例持久化、created_at 跨更新保持 |
 | TransitionError Display | 1 | 错误信息 |
 | stage | 6 | 新建、非法版本、已发布拒绝、cancelled restage、retired 拒绝、幂等刷新 |
 | publish | 3 | 非 Staged 拒绝、不存在拒绝、用户取消 |
@@ -127,3 +153,7 @@ release_ok = create_release(...)    → gh release create ...
 4. **事件溯源而非快照**：释放了"快照 vs 日志"的一致性问题，但增加了启动回放成本。适用于低频操作场景。
 
 5. **CLI 极简**：只暴露版本号。约定的东西（CHANGELOG 位置、存储路径）不进入 CLI 参数列表。
+
+6. **事件与投影分离**：`ReleaseEntry`（journal 行，不可变）与 `ReleaseRecord`（业务实体，投影得出）是两种不同的模型。Entry 只有 `created_at`（事件发生时间），Record 有 `created_at`（首次 stage）和 `updated_at`（最近变更）。分离后 journal 的不可变语义更清晰，record 的字段含义也不被序列化格式污染。
+
+7. **`created_at` 跨尝试保持**：`created_at` 记录的是该 version 首次 stage 的时间，即使被 cancelled 后 restage（新 UUID）也不会重置。这与 event sourcing 的回放逻辑一致：投影时取该 version 所有 events 中最早的 `created_at`。
