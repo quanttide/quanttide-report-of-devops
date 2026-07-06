@@ -1,4 +1,4 @@
-# ADR-001: qtcloud-devops 与 qtcloud-code 的分工边界
+# qtcloud-devops 与 qtcloud-code 的分工边界
 
 - **状态**: 已采纳
 - **日期**: 2026-07-06
